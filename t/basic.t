@@ -91,7 +91,8 @@ GET /
     default_type text/css;
 --- request
 GET /
---- response_body: body{color:red;margin:0;}
+--- response_body
+body{color:red;margin:0;}
 --- no_error_log
 [error]
 
@@ -115,7 +116,8 @@ return a+2}
     default_type application/javascript;
 --- request
 GET /
---- response_body: var s='a  b\nc';var t=1;
+--- response_body
+var s='a  b\nc';var t=1;
 --- no_error_log
 [error]
 
@@ -202,7 +204,8 @@ GET /
     default_type text/javascript;
 --- request
 GET /
---- response_body: var x=1;var y=2;
+--- response_body
+var x=1;var y=2;
 --- no_error_log
 [error]
 
@@ -235,7 +238,8 @@ GET /
     default_type text/css;
 --- request
 GET /
---- response_body: a::after{content:'  hi  ';}
+--- response_body
+a::after{content:'  hi  ';}
 --- no_error_log
 [error]
 

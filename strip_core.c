@@ -497,8 +497,6 @@ strip_minify(strip_kind_t kind, const unsigned char *src, size_t len,
         break;
     }
 
-    /* restore exactly one trailing newline if the source had one and strip
-     * consumed it — keeps output well-formed for tools that expect it */
     if (src_had_nl && n > 0 && dst[n - 1] != '\n') {
         dst[n++] = '\n';
     }
