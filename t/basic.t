@@ -253,3 +253,114 @@ GET /
 --- error_code: 204
 --- no_error_log
 [error]
+
+=== TEST 21: CSS zero-unit stripping (px, em, %)
+--- config
+    strip_css on;
+    return 200 "div { margin: 0px; padding: 0em; top: 0%; font-size: 10px; }\n";
+    default_type text/css;
+--- request
+GET /
+--- response_body
+div{margin:0;padding:0;top:0;font-size:10px;}
+--- no_error_log
+[error]
+
+=== TEST 22: CSS #rrggbb collapsed to #rgb
+--- config
+    strip_css on;
+    return 200 "a { color: #ffaabb; background: #aabbcc; border-color: #112233; }\n";
+    default_type text/css;
+--- request
+GET /
+--- response_body
+a{color:#fab;background:#abc;border-color:#123;}
+--- no_error_log
+[error]
+
+=== TEST 23: CSS #rrggbb not collapsed when pairs differ
+--- config
+    strip_css on;
+    return 200 "a { color: #ff00ab; }\n";
+    default_type text/css;
+--- request
+GET /
+--- response_body
+a{color:#ff00ab;}
+--- no_error_log
+[error]
+
+=== TEST 24: HTML boolean attribute collapsed
+--- config
+    strip on;
+    return 200 '<input disabled="disabled" checked="checked" readonly="readonly">';
+    default_type text/html;
+--- request
+GET /
+--- response_body: <input disabled checked readonly>
+--- no_error_log
+[error]
+
+=== TEST 25: HTML non-boolean attribute not collapsed
+--- config
+    strip on;
+    return 200 '<input type="text" value="hello">';
+    default_type text/html;
+--- request
+GET /
+--- response_body: <input type="text" value="hello">
+--- no_error_log
+[error]
+
+=== TEST 26: SVG comment stripped and whitespace collapsed
+--- config
+    strip_svg on;
+    return 200 '<svg xmlns="http://www.w3.org/2000/svg">
+  <!-- title -->
+  <circle r="5" />
+</svg>
+';
+    default_type image/svg+xml;
+--- request
+GET /
+--- response_body
+<svg xmlns="http://www.w3.org/2000/svg"><circle r="5" /></svg>
+--- no_error_log
+[error]
+
+=== TEST 27: SVG CDATA preserved verbatim
+--- config
+    strip_svg on;
+    return 200 '<svg>
+  <script><![CDATA[  var x = 1;  ]]></script>
+</svg>
+';
+    default_type image/svg+xml;
+--- request
+GET /
+--- response_body
+<svg><script><![CDATA[  var x = 1;  ]]></script></svg>
+--- no_error_log
+[error]
+
+=== TEST 28: SVG off by default — no transform
+--- config
+    return 200 '<svg>  <!-- x -->  <g/></svg>';
+    default_type image/svg+xml;
+--- request
+GET /
+--- response_body: <svg>  <!-- x -->  <g/></svg>
+--- no_error_log
+[error]
+
+=== TEST 29: CSS zero-unit rem and vw also stripped
+--- config
+    strip_css on;
+    return 200 "p { gap: 0rem; width: 0vw; height: 0vh; }\n";
+    default_type text/css;
+--- request
+GET /
+--- response_body
+p{gap:0;width:0;height:0;}
+--- no_error_log
+[error]

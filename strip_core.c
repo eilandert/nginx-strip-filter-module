@@ -35,6 +35,19 @@ sc_is_word(unsigned char c)
 }
 
 static int
+sc_is_hex(unsigned char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+           || (c >= 'A' && c <= 'F');
+}
+
+static unsigned char
+sc_hex_lo(unsigned char c)
+{
+    return (c >= 'a' && c <= 'f') ? c : (c >= 'A' && c <= 'F') ? (unsigned char)(c + 32) : c;
+}
+
+static int
 sc_ci_eq(const unsigned char *p, size_t len, const char *lit)
 {
     size_t i;
@@ -92,6 +105,88 @@ strip_json(const unsigned char *src, size_t len, unsigned char *dst)
 }
 
 /* ---- CSS --------------------------------------------------------------- */
+
+/*
+ * Skip a CSS unit suffix after a literal '0' at src[i].
+ * Returns the new i (pointing past the unit) or the original i if no unit.
+ * Units: px em rem ex ch vw vh vmin vmax pt pc cm mm in %
+ */
+/*
+ * Returns the index just past the unit if src[i..] starts with a CSS unit
+ * that should be stripped from a zero value, or i if no unit matched.
+ * Caller checks: if (ni > i) { i = ni - 1; } so loop ++ lands past unit.
+ */
+static size_t
+css_skip_zero_unit(const unsigned char *src, size_t len, size_t i)
+{
+    static const char * const units[] = {
+        "rem", "vmin", "vmax", "px", "em", "ex", "ch", "vw", "vh",
+        "pt", "pc", "cm", "mm", "in", "%", NULL
+    };
+    int u;
+
+    for (u = 0; units[u]; u++) {
+        size_t ul = strlen(units[u]);
+        if (i + ul <= len && sc_ci_eq(src + i, ul, units[u])) {
+            unsigned char after = (i + ul < len) ? src[i + ul] : 0;
+            /* unit must be followed by boundary: space, punct, or end */
+            if (after == 0 || sc_is_space(after) || after == ';' || after == '}'
+                || after == ')' || after == ',' || after == '!')
+            {
+                return i + ul; /* exclusive end: caller does i = ni - 1 */
+            }
+        }
+    }
+    return i; /* no match: caller checks ni > i */
+}
+
+/*
+ * Try to shorten a 6-digit hex color #rrggbb → #rgb.
+ * src[i] is the first hex digit (after '#' already emitted to dst at o-1).
+ * If collapsible: overwrites dst[o-1] (the '#') with the 3-char form and
+ * returns new i (past the 6th digit). Otherwise returns original i unchanged
+ * and caller emits normally.
+ */
+static size_t
+css_try_short_hex(const unsigned char *src, size_t len, size_t i,
+                  unsigned char *dst, size_t *op)
+{
+    size_t o = *op;
+
+    if (i + 6 > len) {
+        return i;
+    }
+
+    unsigned char r0 = src[i],   r1 = src[i+1];
+    unsigned char g0 = src[i+2], g1 = src[i+3];
+    unsigned char b0 = src[i+4], b1 = src[i+5];
+
+    if (!sc_is_hex(r0) || !sc_is_hex(r1) || !sc_is_hex(g0) ||
+        !sc_is_hex(g1) || !sc_is_hex(b0) || !sc_is_hex(b1))
+    {
+        return i;
+    }
+
+    /* pairs must match (case-insensitive) */
+    if (sc_hex_lo(r0) != sc_hex_lo(r1) || sc_hex_lo(g0) != sc_hex_lo(g1)
+        || sc_hex_lo(b0) != sc_hex_lo(b1))
+    {
+        return i;
+    }
+
+    /* must be followed by a non-hex character (or end) to be a color token */
+    unsigned char after = (i + 6 < len) ? src[i + 6] : 0;
+    if (after != 0 && sc_is_hex(after)) {
+        return i;
+    }
+
+    /* emit #rgb (lowercase) — the '#' is already at dst[o-1] */
+    dst[o++] = sc_hex_lo(r0);
+    dst[o++] = sc_hex_lo(g0);
+    dst[o++] = sc_hex_lo(b0);
+    *op = o;
+    return i + 6; /* skip the 6 original digits; loop ++ not needed here */
+}
 
 static size_t
 strip_css(const unsigned char *src, size_t len, unsigned char *dst)
@@ -162,7 +257,31 @@ strip_css(const unsigned char *src, size_t len, unsigned char *dst)
             pending_space = 0;
         }
 
+        /* #rrggbb → #rgb */
+        if (c == '#') {
+            dst[o++] = c;
+            size_t ni = css_try_short_hex(src, len, i + 1, dst, &o);
+            if (ni != i + 1) {
+                i = ni - 1; /* -1: loop ++ advances past last consumed char */
+                continue;
+            }
+            continue;
+        }
+
         dst[o++] = c;
+
+        /* 0<unit> → 0: only when the '0' is a standalone numeric zero.
+         * Check that the char before the '0' is not a digit (to avoid
+         * trimming units from e.g. 10px, 20em). */
+        if (c == '0') {
+            unsigned char prev2 = (o >= 2) ? dst[o - 2] : 0;
+            if (prev2 < '0' || prev2 > '9') {
+                size_t ni = css_skip_zero_unit(src, len, i + 1);
+                if (ni > i + 1) {
+                    i = ni - 1; /* loop ++ will step past last unit char */
+                }
+            }
+        }
     }
 
     return o;
@@ -344,6 +463,113 @@ strip_js(const unsigned char *src, size_t len, unsigned char *dst)
 
 /* ---- HTML -------------------------------------------------------------- */
 
+/*
+ * Copy a tag from src[i] (pointing at '<') up to and including '>',
+ * collapsing boolean attributes of the form attr="attr" or attr='attr'
+ * to just attr. Returns new i (past '>').
+ *
+ * We parse at byte level: tag name, then attr tokens.
+ * We only collapse when the quoted value is an exact case-sensitive match
+ * of the attribute name (HTML5 boolean attribute contract).
+ */
+static size_t
+html_copy_tag(const unsigned char *src, size_t len, size_t i,
+              unsigned char *dst, size_t *op)
+{
+    size_t o = *op;
+
+    /* emit '<' */
+    dst[o++] = src[i++];
+
+    /* copy tag name (and optional '/' for closing tags) verbatim */
+    while (i < len && !sc_is_space(src[i]) && src[i] != '>' && src[i] != '/') {
+        dst[o++] = src[i++];
+    }
+
+    /* process attributes until '>' */
+    while (i < len && src[i] != '>') {
+        unsigned char c = src[i];
+
+        if (sc_is_space(c)) {
+            dst[o++] = c;
+            i++;
+            continue;
+        }
+
+        /* self-closing slash */
+        if (c == '/') {
+            dst[o++] = c;
+            i++;
+            continue;
+        }
+
+        /* attribute name */
+        size_t name_start = o;
+        while (i < len && src[i] != '=' && src[i] != '>' && !sc_is_space(src[i])) {
+            dst[o++] = src[i++];
+        }
+        size_t name_len = o - name_start;
+
+        if (i >= len || src[i] != '=') {
+            /* bare attribute (already a boolean form) — done */
+            continue;
+        }
+
+        /* consume '=' */
+        i++;
+
+        if (i >= len) {
+            dst[o++] = '=';
+            break;
+        }
+
+        unsigned char q = src[i];
+        if (q != '"' && q != '\'') {
+            /* unquoted value — copy verbatim */
+            dst[o++] = '=';
+            while (i < len && !sc_is_space(src[i]) && src[i] != '>') {
+                dst[o++] = src[i++];
+            }
+            continue;
+        }
+
+        /* quoted value: check if value == name */
+        i++; /* skip opening quote */
+        size_t val_start = i;
+        while (i < len && src[i] != q) {
+            i++;
+        }
+        size_t val_len = i - val_start;
+        if (i < len) {
+            i++; /* skip closing quote */
+        }
+
+        if (val_len == name_len
+            && memcmp(src + val_start, dst + name_start, name_len) == 0)
+        {
+            /* boolean attr — already emitted the name, skip ="value" */
+            continue;
+        }
+
+        /* not boolean — emit ="value" */
+        dst[o++] = '=';
+        dst[o++] = q;
+        size_t v;
+        for (v = val_start; v < val_start + val_len; v++) {
+            dst[o++] = src[v];
+        }
+        dst[o++] = q;
+    }
+
+    /* emit closing '>' */
+    if (i < len && src[i] == '>') {
+        dst[o++] = src[i++];
+    }
+
+    *op = o;
+    return i;
+}
+
 /* Copy a raw element body (<pre>/<textarea>/<script>/<style>) verbatim up to
  * and including its closing tag, returning the source index just past it. */
 static size_t
@@ -434,16 +660,9 @@ strip_html(const unsigned char *src, size_t len, unsigned char *dst)
                 }
             }
 
-            /* copy the tag itself up to and including '>' */
-            while (i < len) {
-                dst[o++] = src[i];
-                if (src[i] == '>') {
-                    i++;
-                    break;
-                }
-                i++;
-            }
-            i--; /* loop ++ will re-advance */
+            /* copy the tag, collapsing boolean attrs */
+            size_t next_i = html_copy_tag(src, len, i, dst, &o);
+            i = next_i - 1; /* loop ++ will re-advance */
 
             if (matched >= 0) {
                 size_t next = html_copy_raw(src, len, i + 1, raw[matched].name,
@@ -473,6 +692,92 @@ strip_html(const unsigned char *src, size_t len, unsigned char *dst)
     return o;
 }
 
+/* ---- SVG --------------------------------------------------------------- */
+
+/*
+ * SVG/XML minifier: strip <!-- comments -->, pass <![CDATA[...]]> verbatim,
+ * collapse inter-tag whitespace. Structurally identical to strip_html but
+ * without raw-text element handling (SVG has no <pre>/<script> semantics at
+ * the filter layer) and with CDATA passthrough.
+ */
+static size_t
+strip_svg(const unsigned char *src, size_t len, unsigned char *dst)
+{
+    size_t i;
+    size_t o = 0;
+    int pending_space = 0;
+
+    for (i = 0; i < len; i++) {
+        unsigned char c = src[i];
+
+        if (c == '<') {
+            if (pending_space && o > 0 && dst[o - 1] != '>') {
+                dst[o++] = ' ';
+            }
+            pending_space = 0;
+
+            /* XML comment <!-- ... --> */
+            if (i + 3 < len && src[i + 1] == '!' && src[i + 2] == '-'
+                && src[i + 3] == '-')
+            {
+                i += 4;
+                while (i + 2 < len
+                       && !(src[i] == '-' && src[i + 1] == '-'
+                            && src[i + 2] == '>'))
+                {
+                    i++;
+                }
+                i += 2; /* lands on '>', loop ++ steps past */
+                pending_space = 1;
+                continue;
+            }
+
+            /* CDATA section <![CDATA[...]]> — copy verbatim */
+            if (i + 8 < len && src[i + 1] == '!' && src[i + 2] == '['
+                && src[i + 3] == 'C' && src[i + 4] == 'D'
+                && src[i + 5] == 'A' && src[i + 6] == 'T'
+                && src[i + 7] == 'A' && src[i + 8] == '[')
+            {
+                while (i < len) {
+                    dst[o++] = src[i];
+                    if (src[i] == ']' && i + 2 < len
+                        && src[i + 1] == ']' && src[i + 2] == '>')
+                    {
+                        dst[o++] = src[i + 1];
+                        dst[o++] = src[i + 2];
+                        i += 3;
+                        break;
+                    }
+                    i++;
+                }
+                i--; /* loop ++ */
+                continue;
+            }
+
+            /* regular tag: copy using html_copy_tag for boolean attr collapse */
+            size_t next_i = html_copy_tag(src, len, i, dst, &o);
+            i = next_i - 1;
+            continue;
+        }
+
+        if (sc_is_space(c)) {
+            pending_space = 1;
+            continue;
+        }
+
+        if (pending_space) {
+            if (o > 0 && dst[o - 1] != '>') {
+                dst[o++] = ' ';
+            }
+            pending_space = 0;
+        }
+
+        dst[o++] = c;
+    }
+
+    return o;
+}
+
 /* ---- dispatch ---------------------------------------------------------- */
 
 size_t
@@ -490,6 +795,9 @@ strip_minify(strip_kind_t kind, const unsigned char *src, size_t len,
         break;
     case STRIP_JS:
         n = strip_js(src, len, dst);
+        break;
+    case STRIP_SVG:
+        n = strip_svg(src, len, dst);
         break;
     case STRIP_HTML:
     default:
